@@ -1,0 +1,440 @@
+blueprint:
+  name: Fancy lights :)
+  description: Jippi's special lights stuff
+  domain: automation
+  input:
+    lights:
+      name: Lights
+      description: Lights that will be controlled.
+      selector:
+        entity:
+          multiple: true
+          domain: light
+    lights_color_temp:
+      name: Light color temperature
+      default: 400
+      selector:
+        color_temp:
+    lights_transition_time:
+      name: Light transition time
+      description: How long time lights should spend transitioning between states
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 1
+          unit_of_measurement: seconds
+    lights_brightness_pct:
+      name: Light brightness
+      description: Can be either a static number or a jinja template (0-100)
+      default: |-
+        {# If we force the lights on, or if its during the day, use maximum brightness #}
+        {% if is_state(var_keep_lights_on_bool, 'on') or 7 < now().hour < 23 %}
+          100
+        {# During the night, use 10% brightness #}
+        {% else %}
+          10
+        {% endif %}
+      selector:
+        template:
+    light_illumination_sensor:
+      name: Light illumination sensor
+      description: |
+        Sensor reporting illumination level
+
+        If you have multiple illumination sensors, please create a `Min / max / mean / median sensor`
+      selector:
+        entity:
+          domain:
+            - sensor
+            - min_max
+    light_illumination_threshold:
+      name: Minimum light illumination level
+      description: |-
+        When motion is detected, whats the illumination threshold required for the lights to turn on?
+
+        Can be either a static number or a jinja template.
+
+        Ignored when forcing the lights on.
+      default: "300"
+      selector:
+        template:
+    motion_sensor:
+      name: Motion Sensor
+      description: |-
+        The motion sensors that will be controlling the lights on/off.
+
+        Rather than using multiple sensors, a Sensor Group is recommended
+      default: []
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: motion
+          multiple: true
+    motion_sensor_no_movement_duration:
+      name: No motion detected duration
+      description: |-
+        Turn off lights after this amount of time with no motion being detected.
+
+        Ignored when "Keep Lights On" mode below is active.
+      selector:
+        duration:
+    default_light_schedule:
+      name: Default light schedule
+      description: |-
+        When to have normal light schedule/brightness on
+      default: schedule.default
+      selector:
+        entity:
+          domain: schedule
+          multiple: false
+    keep_lights_on_bool:
+      name: Keep Lights On Boolean
+      description: |-
+        Helper `input_boolean` used to check if lights should stay on regardless of motion/illumination.
+      selector:
+        entity:
+          domain: input_boolean
+          multiple: false
+    timer:
+      name: Timer
+      description: Timer that will control when lights will be turned off
+      selector:
+        entity:
+          domain: timer
+          multiple: false
+    timer_duration:
+      name: Timer duration
+      default: |-
+        {# keep lights on for 1 hour in keep lights on mode #}
+        {% if is_state(var_keep_lights_on_bool, 'on') %}
+          01:00:00
+        {# between 7am and 11pm keep it on for 5min #}
+        {% elif 7 < now().hour < 23 %}
+          00:05:00
+        {# rest of the day, 10 seconds #}
+        {% else %}
+          00:00:10
+        {% endif %}
+      description: |-
+        For how long lights will stay on before automaticallying turning off.
+
+        Can be a static value or a jinja template
+      selector:
+        template:
+    switches:
+      name: Switches for on/off buttons
+      default:
+      selector:
+        entity:
+          integration: mqtt
+          multiple: true
+    switches_on_trigger:
+      name: Switch "on" button
+      default: "on_press"
+      selector: &switch_button_selector
+        select:
+          mode: dropdown
+          options:
+            - label: First button (On) - Press
+              value: "on-press"
+            - label: First button (On) - Hold
+              value: "on-hold"
+
+            - label: Second button (Up) - Press
+              value: "up-press"
+            - label: Second button (Up) - Hold
+              value: "up-hold"
+
+            - label: Third button (Down) - Press
+              value: "down-press"
+            - label: Third button (Down) - Hold
+              value: "down-hold"
+
+            - label: Fourth button (Off) - Press
+              value: "off-press"
+            - label: Fourth button (Off) - Hold
+              value: "off-hold"
+    switches_off_trigger:
+      name: Switch "off" button
+      default: "on_hold"
+      selector: *switch_button_selector
+    room_presence_sensor:
+      name: Room presence sensor
+      default: input_boolean.dummy_sensor
+      description: |-
+        Room presense sensor via Room Assistance
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: false
+
+# we queue events up, as events within this blueprint will self-trigger
+mode: queued
+
+# default number of queued events, should be a good value
+max: 10
+
+# used by templates!
+variables:
+  var_default_light_schedule: !input default_light_schedule
+  var_keep_lights_on_bool: !input keep_lights_on_bool
+  var_light_illumination_sensor: !input light_illumination_sensor
+  var_light_illumination_threshold: !input light_illumination_threshold
+  var_lights: !input lights
+  var_motion_sensor: !input motion_sensor
+  var_room_presence_sensor: !input room_presence_sensor
+  var_switches: !input switches
+  var_timer: !input timer
+
+  anchors:
+    - &timer_start
+      service: timer.start
+      data:
+        duration: !input timer_duration
+      target:
+        entity_id: !input timer
+    - &turn_on_lights
+      service: light.turn_on
+      target:
+        entity_id: !input lights
+      data:
+        color_temp: !input lights_color_temp
+        brightness_pct: !input lights_brightness_pct
+        transition: !input lights_transition_time
+    - &ackknowldge_end_force
+      service: light.turn_on
+      target:
+        entity_id: !input lights
+      data:
+        effect: okay
+    - &timer_finished
+      condition: template
+      value_template: |-
+        {{
+          trigger.id == "timer_changed"
+          and
+          trigger.from_state.state == "active"
+          and
+          trigger.to_state.state == "idle"
+        }}
+
+trigger:
+  # monitor for any changes in the light state
+  - id: lights_changed
+    platform: state
+    entity_id: !input lights
+  # monitor for any changes in motion
+  - id: motion_sensor_changed
+    platform: state
+    entity_id: !input motion_sensor
+  # monitor for any changes in keeping lights on state
+  - id: keep_lights_on_bool_changed
+    platform: state
+    entity_id:
+      - !input keep_lights_on_bool
+  # monitor for any changes to the timer
+  - id: timer_changed
+    platform: state
+    entity_id:
+      - !input timer
+  # listen for any hue events for turning ON lights
+  - id: hue_event_on
+    platform: state
+    entity_id: !input switches
+    to: !input switches_on_trigger
+  # listen for any hue events for turning OFF lights
+  - id: hue_event_off
+    platform: state
+    entity_id: !input switches
+    to: !input switches_off_trigger
+  # listen for motion no longer being sensed
+  - id: motion_sensor_stopped_sensing_motion
+    platform: state
+    entity_id: !input motion_sensor
+    from: 'on'
+    to: 'off'
+    for: !input motion_sensor_no_movement_duration
+  - id: room_presence_sensor_changed
+    platform: state
+    entity_id: !input room_presence_sensor
+
+action:
+  - choose:
+      ##############################################################################################
+      # 0 - lights are turned on outside of any automation
+      ##############################################################################################
+
+      - conditions:
+          - condition: template
+            value_template: >-
+              {# turn on the timer if lights are turned on, but no timer is running #}
+              {{ trigger.id == "lights_changed" and trigger.to_state.state == "on" }}
+          - condition: state
+            entity_id: !input timer
+            state: idle
+        sequence:
+          - <<: *timer_start
+          - <<: *turn_on_lights
+
+      ##############################################################################################
+      # 1 - keeping the light on being triggered ON
+      ##############################################################################################
+
+      - conditions:
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: hue_event_on
+              - condition: template
+                value_template: |-
+                  {{
+                    trigger.id == "keep_lights_on_bool_changed"
+                    and
+                    trigger.from_state.state == "off"
+                    and
+                    trigger.to_state.state == "on"
+                  }}
+        sequence:
+          - service: input_boolean.turn_on
+            data: {}
+            target:
+              entity_id: !input keep_lights_on_bool
+          - <<: *turn_on_lights
+          - <<: *timer_start
+
+      ##############################################################################################
+      # 2 - keeping the light on being triggered OFF
+      ##############################################################################################
+
+      - conditions:
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: hue_event_off
+              - condition: template
+                value_template: |-
+                  {{
+                    trigger.id == "keep_lights_on_bool_changed"
+                    and
+                    trigger.from_state.state == "on"
+                    and
+                    trigger.to_state.state == "off"
+                  }}
+        sequence:
+          - service: input_boolean.turn_off
+            data: {}
+            target:
+              entity_id: !input keep_lights_on_bool
+          - <<: *ackknowldge_end_force
+          - <<: *timer_start
+          - <<: *turn_on_lights
+
+      ##############################################################################################
+      # 3 - motion ON
+      ##############################################################################################
+      # We don't want to turn lights on based on room_presence_sensor,
+      # since this could turn lights on in other rooms when it think there is room room presence.
+      ##############################################################################################
+
+      - conditions:
+        - condition: template
+          value_template: |-
+            {{
+              trigger.id == "motion_sensor_changed"
+              and
+              trigger.to_state.state == "on"
+            }}
+
+        - condition: numeric_state
+          entity_id: !input light_illumination_sensor
+          below: !input light_illumination_threshold
+        # if we're keeping lights on, don't restart timer or touch the light
+        # configuration
+        - condition: state
+          entity_id: !input keep_lights_on_bool
+          state: 'off'
+        sequence:
+          - <<: *timer_start
+          - <<: *turn_on_lights
+
+      ##############################################################################################
+      # 3.5 - keep lights on if room presense is active
+      ##############################################################################################
+
+      - conditions:
+        - <<: *timer_finished
+        - condition: state
+          entity_id: !input room_presence_sensor
+          state: 'on'
+        sequence:
+          # restart timer
+          - <<: *timer_start
+
+      ##############################################################################################
+      # 4 - motion detected OFF
+      ##############################################################################################
+
+      - conditions:
+          - condition: trigger
+            id: motion_sensor_stopped_sensing_motion
+          - condition: state
+            entity_id: !input keep_lights_on_bool
+            state: 'off'
+        sequence:
+          - service: timer.finish
+            data: {}
+            target:
+              entity_id: !input timer
+
+      ##############################################################################################
+      # 5 - timer stopping or lights being turned off
+      ##############################################################################################
+
+      - conditions:
+          - condition: or
+            conditions:
+              - <<: *timer_finished
+              - condition: template
+                value_template: |-
+                  {{
+                    trigger.id == "lights_changed"
+                    and
+                    trigger.from_state.state == "on"
+                    and
+                    trigger.to_state.state == "off"
+                  }}
+        sequence:
+          - if:
+              - condition: state
+                entity_id: !input keep_lights_on_bool
+                state: 'on'
+            then:
+              - service: input_boolean.turn_off
+                data: {}
+                target:
+                  entity_id: !input keep_lights_on_bool
+          - if:
+              - condition: state
+                entity_id: !input lights
+                state: 'on'
+                match: any
+            then:
+              - service: light.turn_off
+                target:
+                  entity_id: !input lights
+                data:
+                  transition: !input lights_transition_time
+          - if:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: !input timer
+                    state: idle
+            then:
+              - service: timer.finish
+                data: {}
+                target:
+                  entity_id: !input timer
+    default: []
